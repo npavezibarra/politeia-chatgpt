@@ -78,145 +78,121 @@ function politeia_chatgpt_shortcode_callback() {
 add_shortcode('politeia_chatgpt_input', 'politeia_chatgpt_shortcode_callback');
 
 
-/** ========= AJAX handler ========= */
+// ========= AJAX handler unificado =========
 function politeia_process_input_ajax() {
-    // Seguridad
     check_ajax_referer('politeia-chatgpt-nonce', 'nonce');
 
-    // DB
-    global $wpdb;
-    $table_name = $wpdb->prefix . 'politeia_user_books'; // (ya no se usa en este flujo, se deja por compat.)
-
     $type = isset($_POST['type']) ? sanitize_text_field($_POST['type']) : '';
-    if (! $type) {
+    if (!$type) {
         wp_send_json_error('Tipo de entrada no válido.');
     }
 
-    // Defaults de instrucciones (por si están vacías en admin)
+    // Instrucciones con defaults
     $default_text_instr = 'A partir del siguiente texto, extrae los libros y devuelve SOLO un JSON con la forma: { "books": [ { "title": "...", "author": "..." } ] }.';
     $default_img_instr  = 'Analiza la imagen y devuelve SOLO un JSON con { "books": [ { "title": "...", "author": "..." } ] }. Omite elementos dudosos.';
 
-    // Instrucciones desde Admin
     $instr_text  = get_option('politeia_gpt_instruction_text', '');
     $instr_audio = get_option('politeia_gpt_instruction_audio', '');
     $instr_image = get_option('politeia_gpt_instruction_image', '');
 
     $instr_text  = $instr_text  !== '' ? $instr_text  : $default_text_instr;
-    $instr_audio = $instr_audio !== '' ? $instr_audio : $instr_text; // fallback a texto
+    $instr_audio = $instr_audio !== '' ? $instr_audio : $instr_text;
     $instr_image = $instr_image !== '' ? $instr_image : $default_img_instr;
 
-    $raw_from_api = '';
+    // Asegura que la función de cola está cargada
+    if ( ! function_exists('politeia_chatgpt_queue_confirm_items') ) {
+        if ( defined('POLITEIA_CHATGPT_DIR') ) {
+            $p = POLITEIA_CHATGPT_DIR . 'modules/book-detection/functions-book-confirm-queue.php';
+            if ( file_exists($p) ) require_once $p;
+        }
+    }
 
     try {
-        switch ($type) {
-            case 'image':
-                if (empty($_POST['image_data'])) {
-                    throw new Exception('No se recibieron datos de imagen.');
-                }
-                // IMPORTANTE: la función politeia_chatgpt_process_image actualmente
-                // acepta SOLO 1 parámetro ($base64_image). Si luego la actualizas
-                // para recibir instrucciones, aquí podrás pasar $instr_image.
-                $raw_from_api = politeia_chatgpt_process_image($_POST['image_data']);
-                break;
-
-            case 'audio':
-                if (empty($_FILES['audio_data'])) {
-                    throw new Exception('No se recibió el archivo de audio.');
-                }
-
-                if (! function_exists('wp_handle_upload')) {
-                    require_once ABSPATH . 'wp-admin/includes/file.php';
-                }
-
-                $file = $_FILES['audio_data'];
-                // Aseguramos una extensión válida si viene sin una conocida
-                if (!preg_match('/\.(webm|mp4|m4a|wav|ogg)$/i', $file['name'])) {
-                    $file['name'] = 'grabacion-' . time() . '.webm';
-                }
-
-                $movefile = wp_handle_upload($file, ['test_form' => false]);
-
-                if ($movefile && empty($movefile['error'])) {
-                    $transcription = politeia_chatgpt_transcribe_audio($movefile['file'], $file['name']);
-                    @unlink($movefile['file']); // limpia temporal
-
-                    if (strpos($transcription, 'Error:') === 0) {
-                        throw new Exception($transcription);
-                    }
-
-                    // Construye el prompt y llama al modelo
-                    $full_prompt  = $instr_audio . "\n\nTexto:\n\"{$transcription}\"";
-                    $raw_from_api = politeia_chatgpt_send_query($full_prompt);
-                } else {
-                    throw new Exception('Error al manejar el archivo de audio: ' . ($movefile['error'] ?? 'desconocido'));
-                }
-                break;
-
-            case 'text':
-                if (empty($_POST['prompt'])) {
-                    throw new Exception('El texto no puede estar vacío.');
-                }
-                $user_text    = sanitize_textarea_field($_POST['prompt']);
-                $full_prompt  = $instr_text . "\n\nTexto:\n\"{$user_text}\"";
-                $raw_from_api = politeia_chatgpt_send_query($full_prompt);
-                break;
-
-            default:
-                throw new Exception('Tipo de entrada no válido.');
+        // 1) Llamada a OpenAI según tipo
+        $raw_from_api = '';
+        if ($type === 'image') {
+            if (empty($_POST['image_data'])) throw new Exception('No se recibieron datos de imagen.');
+            $raw_from_api = politeia_chatgpt_process_image($_POST['image_data']); // devuelve string (JSON)
+        } elseif ($type === 'audio') {
+            if (empty($_FILES['audio_data'])) throw new Exception('No se recibió el archivo de audio.');
+            if (!function_exists('wp_handle_upload')) require_once ABSPATH . 'wp-admin/includes/file.php';
+            $file = $_FILES['audio_data'];
+            if (!preg_match('/\.(webm|mp4|m4a|wav|ogg)$/i', $file['name'])) $file['name'] = 'grabacion-' . time() . '.webm';
+            $up = wp_handle_upload($file, ['test_form' => false]);
+            if (!$up || !empty($up['error'])) throw new Exception('Error al manejar el archivo de audio: ' . ($up['error'] ?? 'desconocido'));
+            $txt = politeia_chatgpt_transcribe_audio($up['file'], $file['name']);
+            @unlink($up['file']);
+            if (strpos($txt, 'Error:') === 0) throw new Exception($txt);
+            $prompt       = $instr_audio . "\n\nTexto:\n\"{$txt}\"";
+            $raw_from_api = politeia_chatgpt_send_query($prompt);
+        } elseif ($type === 'text') {
+            if (empty($_POST['prompt'])) throw new Exception('El texto no puede estar vacío.');
+            $user_text    = sanitize_textarea_field($_POST['prompt']);
+            $prompt       = $instr_text . "\n\nTexto:\n\"{$user_text}\"";
+            $raw_from_api = politeia_chatgpt_send_query($prompt);
+        } else {
+            throw new Exception('Tipo de entrada no válido.');
         }
 
         if (strpos($raw_from_api, 'Error:') === 0) {
             throw new Exception($raw_from_api);
         }
 
-        // ------- Parseo de JSON -------
+        // 2) Parseo de JSON de libros
         if (function_exists('politeia_extract_json')) {
-            // Por si la respuesta viene envuelta en ```json ... ```
             $raw_from_api = politeia_extract_json($raw_from_api);
         }
 
         $decoded = json_decode($raw_from_api, true);
         if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception("La respuesta de la API no es un JSON válido. Respuesta recibida:\n" . $raw_from_api);
+            throw new Exception("La respuesta de la API no es un JSON válido.\n" . $raw_from_api);
         }
 
-        // Acepta { "books": [...] } o [ {...}, ... ]
         $books = [];
         if (isset($decoded['books']) && is_array($decoded['books'])) {
             $books = $decoded['books'];
         } elseif (is_array($decoded) && (empty($decoded) || isset($decoded[0]))) {
             $books = $decoded;
-        } else {
-            throw new Exception("La respuesta no tiene el formato esperado. Respuesta:\n" . $raw_from_api);
         }
 
-        // ------- ENCOLAR EN wp_politeia_book_confirm -------
-        if (! function_exists('politeia_chatgpt_queue_confirm_items')) {
-            throw new Exception('Falta la función politeia_chatgpt_queue_confirm_items().');
+        // Normaliza candidatos (solo los válidos)
+        $candidates = [];
+        foreach ((array)$books as $b) {
+            $t = isset($b['title'])  ? trim((string)$b['title'])  : '';
+            $a = isset($b['author']) ? trim((string)$b['author']) : '';
+            if ($t !== '' && $a !== '') {
+                $candidates[] = ['title' => $t, 'author' => $a];
+            }
         }
 
-        $raw_payload = is_string($raw_from_api) ? $raw_from_api : wp_json_encode($raw_from_api);
+        // 3) ENCOLAR en wp_politeia_book_confirm (ESTE ERA EL PASO QUE FALTABA/NO CUADRABA)
+        if (!function_exists('politeia_chatgpt_queue_confirm_items')) {
+            throw new Exception('Falta politeia_chatgpt_queue_confirm_items().');
+        }
 
-        $queued = politeia_chatgpt_queue_confirm_items(
-            is_array($books) ? $books : [],
+        $queue_result = politeia_chatgpt_queue_confirm_items(
+            $candidates,
             [
                 'user_id'      => get_current_user_id(),
-                'input_type'   => $type,                                  // 'text' | 'audio' | 'image'
-                'source_note'  => ($type === 'image') ? 'vision' : $type, // nota útil para auditoría
-                'raw_response' => $raw_payload,
+                'input_type'   => $type,
+                'source_note'  => ($type === 'image') ? 'vision' : $type,
+                'raw_response' => is_string($raw_from_api) ? $raw_from_api : wp_json_encode($raw_from_api),
             ]
         );
 
+        // 4) Respuesta: devolvemos lo que se metió en cola (para que la UI no invente tablas)
         wp_send_json_success([
             'message'      => 'Candidatos encolados para confirmación.',
-            'queued'       => (int) $queued,
-            'raw_response' => $raw_from_api,
+            'queued'       => (int)($queue_result['queued']  ?? 0),
+            'skipped'      => (int)($queue_result['skipped'] ?? 0),
+            'items'        => (array)($queue_result['items'] ?? []), // estos son los que verás en la tabla
         ]);
 
     } catch (Exception $e) {
         wp_send_json_error($e->getMessage());
     }
 }
+
 
 add_action('wp_ajax_politeia_process_input', 'politeia_process_input_ajax');
 add_action('wp_ajax_nopriv_politeia_process_input', 'politeia_process_input_ajax'); // si permites uso sin login

@@ -39,6 +39,7 @@ class Politeia_Book_Confirm_Schema {
 
     /**
      * Ensure table is created/updated (idempotent).
+     * Adds a UNIQUE KEY to prevent duplicates for (user_id, hash, status).
      * Safe to call multiple times; uses dbDelta.
      * @return void
      */
@@ -49,31 +50,51 @@ class Politeia_Book_Confirm_Schema {
         $charset_collate = $wpdb->get_charset_collate();
 
         $sql = "CREATE TABLE {$table} (
-          id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-          user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
-          input_type VARCHAR(20) NOT NULL,              -- text | audio | image
-          source_note VARCHAR(190) DEFAULT '',
-          title VARCHAR(255) NOT NULL,
-          author VARCHAR(255) NOT NULL,
-          normalized_title VARCHAR(255) DEFAULT NULL,
-          normalized_author VARCHAR(255) DEFAULT NULL,
-          title_author_hash CHAR(64) DEFAULT NULL,      -- dedupe
-          external_isbn VARCHAR(32) DEFAULT NULL,
-          external_source VARCHAR(50) DEFAULT NULL,     -- openlibrary | googlebooks | null
-          external_score FLOAT DEFAULT NULL,
-          match_method VARCHAR(30) DEFAULT NULL,        -- hash | normalized_like | raw_like | external | none
-          matched_book_id BIGINT UNSIGNED DEFAULT NULL, -- if matched with internal catalog
-          status ENUM('pending','confirmed','discarded') NOT NULL DEFAULT 'pending',
-          raw_response LONGTEXT NULL,
-          created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-          updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-          PRIMARY KEY (id),
-          KEY idx_user_status (user_id, status),
-          KEY idx_hash (title_author_hash),
-          KEY idx_matched (matched_book_id)
-        ) {$charset_collate};";
+            id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            user_id BIGINT UNSIGNED NOT NULL DEFAULT 0,
+            input_type VARCHAR(20) NOT NULL,
+            source_note VARCHAR(190) DEFAULT '',
+            title VARCHAR(255) NOT NULL,
+            author VARCHAR(255) NOT NULL,
+            normalized_title VARCHAR(255) DEFAULT NULL,
+            normalized_author VARCHAR(255) DEFAULT NULL,
+            title_author_hash CHAR(64) DEFAULT NULL,
+            external_isbn VARCHAR(32) DEFAULT NULL,
+            external_source VARCHAR(50) DEFAULT NULL,
+            external_score FLOAT DEFAULT NULL,
+            match_method VARCHAR(30) DEFAULT NULL,
+            matched_book_id BIGINT UNSIGNED DEFAULT NULL,
+            status ENUM('pending','confirmed','discarded') NOT NULL DEFAULT 'pending',
+            raw_response LONGTEXT NULL,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            PRIMARY KEY (id),
+            UNIQUE KEY uq_user_hash_status (user_id, title_author_hash, status),
+            KEY idx_user_status (user_id, status),
+            KEY idx_hash (title_author_hash),
+            KEY idx_matched (matched_book_id)
+          ) {$charset_collate};";          
 
         require_once ABSPATH . 'wp-admin/includes/upgrade.php';
         dbDelta( $sql );
+
+        // En caso de instalaciones viejas sin el índice único, lo añadimos “a mano”.
+        self::maybe_add_unique_index();
+    }
+
+    /**
+     * Add the unique index if it doesn't exist yet.
+     */
+    public static function maybe_add_unique_index() {
+        global $wpdb;
+        $table = self::table_name();
+
+        // ¿Existe ya el índice?
+        // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+        $exists = $wpdb->get_var( "SHOW INDEX FROM {$table} WHERE Key_name = 'uniq_user_hash_pending'" );
+        if ( ! $exists ) {
+            // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared
+            $wpdb->query( "ALTER TABLE {$table} ADD UNIQUE KEY uniq_user_hash_pending (user_id, title_author_hash, status)" );
+        }
     }
 }
