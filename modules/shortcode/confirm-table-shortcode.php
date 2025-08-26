@@ -1,285 +1,311 @@
 <?php
 /**
  * Shortcode: [politeia_confirm_table]
- * Muestra los libros pendientes desde wp_politeia_book_confirm (status='pending')
- * del usuario actual. Renderiza server–side para que se vean siempre, y agrega
- * JS mínimo para Confirm / Confirm All y refresco opcional.
+ * - Lista pendientes desde wp_politeia_book_confirm (usuario actual)
+ * - Botón Confirm / Confirm All (usa endpoints ya existentes)
+ * - Íconos ✎ para editar Título/Autor inline y guardar automáticamente
+ * - Tras editar, relanza lookup del año para esa fila
  */
 
 if ( ! defined('ABSPATH') ) exit;
 
 function politeia_confirm_table_shortcode() {
-    if ( ! is_user_logged_in() ) {
-        return '<p>Debes iniciar sesión para ver tus libros pendientes.</p>';
-    }
+	if ( ! is_user_logged_in() ) {
+		return '<p>You must be logged in.</p>';
+	}
 
-    global $wpdb;
-    $uid        = get_current_user_id();
-    $tbl        = $wpdb->prefix . 'politeia_book_confirm';
-    $items      = $wpdb->get_results(
-        $wpdb->prepare(
-            "SELECT id, title, author
-               FROM {$tbl}
-              WHERE user_id=%d AND status='pending'
-              ORDER BY id DESC
-              LIMIT 200",
-            $uid
-        ),
-        ARRAY_A
-    );
-    $count      = is_array($items) ? count($items) : 0;
+	global $wpdb;
+	$user_id = get_current_user_id();
+	$tbl     = $wpdb->prefix . 'politeia_book_confirm';
 
-    // Nonce para AJAX (usamos el mismo que en el resto del plugin)
-    $nonce = wp_create_nonce('politeia-chatgpt-nonce');
-    $ajax  = admin_url('admin-ajax.php');
+	$rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT id, title, author
+			   FROM {$tbl}
+			  WHERE user_id=%d AND status='pending'
+			  ORDER BY id DESC",
+			$user_id
+		),
+		ARRAY_A
+	);
 
-    ob_start();
-    ?>
-    <style>
-      .pol-confirm-card{background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 6px 20px rgba(0,0,0,.06);margin:16px 0}
-      .pol-confirm-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
-      .pol-confirm-title{margin:0;font-weight:600}
-      .pol-confirm-table{width:100%;border-collapse:collapse}
-      .pol-confirm-table th,.pol-confirm-table td{padding:14px 16px;border-top:1px solid #eee;text-align:left}
-      .pol-btn{padding:10px 16px;border-radius:12px;border:1px solid #e6e6e6;background:#f7f7f7;cursor:pointer}
-      .pol-btn-primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
-      .pol-btn[disabled]{opacity:.6;cursor:not-allowed}
-      .pol-muted{opacity:.55}
-    </style>
+	ob_start();
+	$nonce = wp_create_nonce('politeia-chatgpt-nonce');
+	?>
+	<div id="pol-confirm" class="pol-confirm" data-nonce="<?php echo esc_attr($nonce); ?>">
+		<div class="pol-card">
+			<div class="pol-card__header">
+				<h3 class="pol-title">Queued candidates: <span id="pol-count"><?php echo (int) count($rows); ?></span></h3>
+				<button class="pol-btn pol-btn-primary" id="pol-confirm-all" <?php disabled( empty($rows) ); ?>>Confirm All</button>
+			</div>
 
-    <div class="pol-confirm-card" id="pol-confirm-card"
-         data-ajax="<?php echo esc_url($ajax); ?>"
-         data-nonce="<?php echo esc_attr($nonce); ?>">
-      <div class="pol-confirm-head">
-        <h3 class="pol-confirm-title">
-          Queued candidates: <span id="pol-confirm-count"><?php echo (int)$count; ?></span>
-        </h3>
-        <button class="pol-btn pol-btn-primary" id="pol-confirm-all-btn">Confirm All</button>
-      </div>
+			<div class="pol-table-wrap">
+				<table class="pol-table" id="pol-table">
+					<thead>
+						<tr>
+							<th>Title</th>
+							<th>Author</th>
+							<th style="width:120px">Year</th>
+							<th style="width:150px"></th>
+						</tr>
+					</thead>
+					<tbody>
+					<?php if ( empty($rows) ) : ?>
+						<tr><td colspan="4">No pending candidates.</td></tr>
+					<?php else : foreach ( $rows as $r ) : ?>
+						<tr class="pol-row" data-id="<?php echo (int) $r['id']; ?>">
+							<td class="pol-td">
+								<span class="pol-cell" data-field="title">
+									<span class="pol-text"><?php echo esc_html($r['title']); ?></span>
+									<button class="pol-edit" title="Edit" aria-label="Edit title">✎</button>
+								</span>
+							</td>
+							<td class="pol-td">
+								<span class="pol-cell" data-field="author">
+									<span class="pol-text"><?php echo esc_html($r['author']); ?></span>
+									<button class="pol-edit" title="Edit" aria-label="Edit author">✎</button>
+								</span>
+							</td>
+							<td class="pol-td pol-year"><span class="pol-year-text">…</span></td>
+							<td class="pol-td pol-actions">
+								<button class="pol-btn pol-btn-ghost pol-confirm-one">Confirm</button>
+							</td>
+						</tr>
+					<?php endforeach; endif; ?>
+					</tbody>
+				</table>
+			</div>
+		</div>
+	</div>
 
-      <div class="pol-confirm-table-wrap">
-        <table class="pol-confirm-table">
-          <thead>
-            <tr>
-              <th style="width:44%">Title</th>
-              <th style="width:36%">Author</th>
-              <th style="width:10%">Year</th>
-              <th style="width:10%"></th>
-            </tr>
-          </thead>
-          <tbody id="pol-confirm-tbody">
-            <?php if ($count === 0): ?>
-              <tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>
-            <?php else: foreach ($items as $row): ?>
-              <tr data-id="<?php echo (int)$row['id']; ?>"
-                  data-title="<?php echo esc_attr($row['title']); ?>"
-                  data-author="<?php echo esc_attr($row['author']); ?>">
-                <td><?php echo esc_html($row['title']); ?></td>
-                <td><?php echo esc_html($row['author']); ?></td>
-                <td class="pol-year">…</td>
-                <td>
-                  <button class="pol-btn" data-pol-confirm>Confirm</button>
-                </td>
-              </tr>
-            <?php endforeach; endif; ?>
-          </tbody>
-        </table>
-      </div>
-    </div>
+	<style>
+		.pol-card{background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 6px 20px rgba(0,0,0,.06);}
+		.pol-card__header{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px;}
+		.pol-title{margin:0;font-weight:600;}
+		.pol-table{width:100%;border-collapse:collapse;}
+		.pol-table th,.pol-table td{padding:14px 16px;border-top:1px solid #eee;text-align:left;}
+		.pol-btn{padding:10px 16px;border-radius:12px;border:1px solid #e6e6e6;background:#f7f7f7;cursor:pointer}
+		.pol-btn-primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
+		.pol-btn-ghost{background:#fafafa}
+		.pol-edit{margin-left:8px;font-size:12px;line-height:1;border:0;background:#f0f0f0;border-radius:8px;padding:4px 6px;cursor:pointer}
+		.pol-input{width:100%;max-width:600px;padding:6px 8px;border:1px solid #ddd;border-radius:8px;font:inherit;}
+		.pol-row.saving{opacity:.6}
+	</style>
 
-    <script>
-    (function(){
-      const card   = document.getElementById('pol-confirm-card');
-      const tbody  = document.getElementById('pol-confirm-tbody');
-      const btnAll = document.getElementById('pol-confirm-all-btn');
-      const countE = document.getElementById('pol-confirm-count');
-      const AJAX   = card?.dataset.ajax || '';
-      const NONCE  = card?.dataset.nonce || '';
+	<script>
+	(function(){
+		const root  = document.getElementById('pol-confirm');
+		if (!root) return;
 
-      const qs  = (sel,root=document)=>root.querySelector(sel);
-      const qsa = (sel,root=document)=>Array.from(root.querySelectorAll(sel));
+		const NONCE = root.dataset.nonce || '';
+		const AJAX  = (window.politeia_chatgpt_vars && window.politeia_chatgpt_vars.ajaxurl) ? window.politeia_chatgpt_vars.ajaxurl : (window.ajaxurl || '/wp-admin/admin-ajax.php');
 
-      function rows(){ return qsa('tr[data-id]', tbody); }
-      function leftCount(){ return rows().length; }
-      function updateCount(){ if(countE) countE.textContent = String(leftCount()); }
+		function q(sel, el){ return (el||document).querySelector(sel); }
+		function qa(sel, el){ return Array.from((el||document).querySelectorAll(sel)); }
 
-      function rowToItem(tr){
-        const id     = parseInt(tr.dataset.id,10);
-        const title  = tr.dataset.title || qs('td:nth-child(1)', tr)?.textContent || '';
-        const author = tr.dataset.author|| qs('td:nth-child(2)', tr)?.textContent || '';
-        const ytxt   = qs('.pol-year', tr)?.textContent || '';
-        const y      = /^\d{3,4}$/.test(ytxt.trim()) ? parseInt(ytxt,10) : null;
-        return { id, title, author, year: y };
-      }
+		function setCount(n){ const c = q('#pol-count'); if (c) c.textContent = String(n); }
 
-      async function postFD(fd){
-        const res = await fetch(AJAX, { method:'POST', body:fd });
-        try { return await res.clone().json(); }
-        catch { return { success:false, data: await res.text() }; }
-      }
+		async function postFD(fd){
+			const res = await fetch(AJAX, { method:'POST', body:fd });
+			try { return await res.clone().json(); }
+			catch(_e){ return { success:false, data: await res.text() }; }
+		}
 
-      // ---- Lookup de años (OpenLibrary/Google) para las filas visibles
-      async function lookupYears(){
-        const list = rows().map(rowToItem);
-        if (!list.length) return;
-        try{
-          const fd = new FormData();
-          fd.append('action','politeia_lookup_book_years');
-          fd.append('nonce', NONCE);
-          fd.append('items', JSON.stringify(list));
-          const resp = await postFD(fd);
-          if (resp && resp.success && resp.data && Array.isArray(resp.data.years)) {
-            rows().forEach((tr, i) => {
-              const cell = qs('.pol-year', tr);
-              const y    = resp.data.years[i];
-              if (cell) cell.textContent = Number.isInteger(y) ? String(y) : '—';
-            });
-          } else {
-            // Muestra guiones si falla
-            rows().forEach(tr => { const c = qs('.pol-year',tr); if(c) c.textContent = '—'; });
-          }
-        } catch {
-          rows().forEach(tr => { const c = qs('.pol-year',tr); if(c) c.textContent = '—'; });
-        }
-      }
+		// -------- Lookup de años al cargar --------
+		async function lookupYearsForVisible(){
+			const rows = qa('tr.pol-row', root);
+			if (!rows.length) return;
 
-      // ---- Confirm individual
-      tbody.addEventListener('click', async (ev)=>{
-        const btn = ev.target.closest('button[data-pol-confirm]');
-        if (!btn) return;
-        const tr = btn.closest('tr'); if (!tr) return;
-        btn.disabled = true;
+			const items = rows.map(tr => {
+				return {
+					title:  q('[data-field="title"] .pol-text', tr)?.textContent?.trim() || '',
+					author: q('[data-field="author"] .pol-text', tr)?.textContent?.trim() || ''
+				};
+			});
+			try{
+				const fd = new FormData();
+				fd.append('action','politeia_lookup_book_years');
+				fd.append('nonce', NONCE);
+				fd.append('items', JSON.stringify(items));
+				const resp = await postFD(fd);
+				if (resp && resp.success && resp.data && Array.isArray(resp.data.years)){
+					rows.forEach((tr, i) => {
+						const y = resp.data.years[i];
+						const cell = q('.pol-year-text', tr);
+						if (cell) cell.textContent = Number.isInteger(y) ? String(y) : '…';
+					});
+				}
+			} catch(e){
+				console.warn('[Confirm Table] year lookup failed', e);
+			}
+		}
 
-        try{
-          const fd = new FormData();
-          fd.append('action','politeia_buttons_confirm');
-          fd.append('nonce', NONCE);
-          fd.append('items', JSON.stringify([rowToItem(tr)]));
-          const resp = await postFD(fd);
-          if (resp && resp.success){
-            tr.remove();
-            if (!rows().length) tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
-            updateCount();
-          } else {
-            btn.disabled = false;
-            console.error('[Confirm] error', resp);
-          }
-        } catch(e){
-          btn.disabled = false;
-          console.error(e);
-        }
-      });
+		// -------- Edición inline (título/autor) --------
+		root.addEventListener('click', (ev)=>{
+			const btn = ev.target.closest('.pol-edit');
+			if (!btn) return;
 
-      // ---- Confirm All
-      btnAll.addEventListener('click', async ()=>{
-        const list = rows().map(rowToItem);
-        if (!list.length) return;
+			const cell = btn.closest('.pol-cell');
+			const tr   = btn.closest('tr.pol-row');
+			if (!cell || !tr) return;
 
-        btnAll.disabled = true;
-        try{
-          const fd = new FormData();
-          fd.append('action','politeia_buttons_confirm_all');
-          fd.append('nonce', NONCE);
-          fd.append('items', JSON.stringify(list));
-          const resp = await postFD(fd);
-          if (resp && resp.success){
-            tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
-            updateCount();
-          } else {
-            btnAll.disabled = false;
-            console.error('[Confirm All] error', resp);
-          }
-        } catch(e){
-          btnAll.disabled = false;
-          console.error(e);
-        }
-      });
+			const field = cell.dataset.field; // title|author
+			const textEl = q('.pol-text', cell);
+			if (!field || !textEl) return;
 
-      // ---- Refresh (opcional): escucha un evento para recargar desde el servidor
-      window.addEventListener('politeia:queue-updated', refreshFromServer);
+			// ya en modo edición?
+			if (q('input.pol-input', cell)) return;
 
-      async function refreshFromServer(){
-        try{
-          const fd = new FormData();
-          fd.append('action','politeia_confirm_table_fetch');
-          fd.append('nonce', NONCE);
-          const resp = await postFD(fd);
-          if (resp && resp.success && Array.isArray(resp.data?.items)) {
-            renderRows(resp.data.items);
-            updateCount();
-            lookupYears();
-          }
-        } catch(e){ console.error('[Refresh] error', e); }
-      }
+			const current = textEl.textContent;
+			const input = document.createElement('input');
+			input.type = 'text';
+			input.className = 'pol-input';
+			input.value = current;
 
-      function renderRows(items){
-        if (!items.length){
-          tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
-          return;
-        }
-        tbody.innerHTML = items.map(it => `
-          <tr data-id="${Number(it.id)}"
-              data-title="${escapeHtml(it.title)}"
-              data-author="${escapeHtml(it.author)}">
-            <td>${escapeHtml(it.title)}</td>
-            <td>${escapeHtml(it.author)}</td>
-            <td class="pol-year">…</td>
-            <td><button class="pol-btn" data-pol-confirm>Confirm</button></td>
-          </tr>
-        `).join('');
-      }
+			// swap
+			textEl.style.display = 'none';
+			cell.appendChild(input);
+			input.focus();
+			input.select();
 
-      function escapeHtml(s){
-        return String(s ?? '')
-          .replaceAll('&','&amp;').replaceAll('<','&lt;')
-          .replaceAll('>','&gt;').replaceAll('"','&quot;')
-          .replaceAll("'","&#039;");
-      }
+			const done = async (commit)=>{
+				input.removeEventListener('blur', onBlur);
+				input.removeEventListener('keydown', onKey);
+				if (!commit){
+					cell.removeChild(input);
+					textEl.style.display = '';
+					return;
+				}
+				const value = input.value.trim();
+				if (value === '' || value === current){
+					cell.removeChild(input);
+					textEl.style.display = '';
+					return;
+				}
 
-      // Inicial: mirar años para lo que ya está renderizado
-      lookupYears();
+				try{
+					tr.classList.add('saving');
+					const fd = new FormData();
+					fd.append('action','politeia_confirm_update_field');
+					fd.append('nonce', NONCE);
+					fd.append('id', tr.dataset.id || '0');
+					fd.append('field', field);
+					fd.append('value', value);
+					const resp = await postFD(fd);
+					if (resp && resp.success){
+						textEl.textContent = value;
+						// Relookup year para esta fila
+						await lookupYearsForVisible();
+					} else {
+						alert('Error saving change.');
+						console.warn(resp);
+					}
+				} catch(e){
+					alert('Network error.');
+					console.error(e);
+				} finally {
+					tr.classList.remove('saving');
+					cell.removeChild(input);
+					textEl.style.display = '';
+				}
+			};
 
-      // (Opcional) auto-refresh suave 1 vez a los 1.5s por si justo vienes de subir foto:
-      setTimeout(refreshFromServer, 1500);
-    })();
-    </script>
-    <?php
-    return ob_get_clean();
+			const onBlur = () => done(true);
+			const onKey = (e) => {
+				if (e.key === 'Enter') { e.preventDefault(); done(true); }
+				else if (e.key === 'Escape') { e.preventDefault(); done(false); }
+			};
+
+			input.addEventListener('blur', onBlur);
+			input.addEventListener('keydown', onKey);
+		});
+
+		// -------- Confirm individual --------
+		root.addEventListener('click', async (ev)=>{
+			const btn = ev.target.closest('.pol-confirm-one');
+			if (!btn) return;
+
+			const tr = btn.closest('tr.pol-row');
+			if (!tr) return;
+
+			try{
+				btn.disabled = true;
+				const item = {
+					title:  q('[data-field="title"] .pol-text', tr)?.textContent?.trim() || '',
+					author: q('[data-field="author"] .pol-text', tr)?.textContent?.trim() || '',
+					year:   (q('.pol-year-text', tr)?.textContent || '').match(/^\d{3,4}$/) ? parseInt(q('.pol-year-text', tr).textContent,10) : null,
+					id:     parseInt(tr.dataset.id || '0', 10)
+				};
+				const fd = new FormData();
+				fd.append('action','politeia_buttons_confirm'); // ya existente
+				fd.append('nonce', NONCE);
+				fd.append('items', JSON.stringify([item]));
+				const resp = await postFD(fd);
+				if (resp && resp.success){
+					// elimina fila y actualiza contador
+					tr.parentNode.removeChild(tr);
+					setCount(qa('tr.pol-row', root).length);
+				} else {
+					alert('Error confirming.');
+					btn.disabled = false;
+					console.warn(resp);
+				}
+			} catch(e){
+				alert('Network error.');
+				btn.disabled = false;
+				console.error(e);
+			}
+		});
+
+		// -------- Confirm All --------
+		const btnAll = document.getElementById('pol-confirm-all');
+		if (btnAll){
+			btnAll.addEventListener('click', async ()=>{
+				const rows = qa('tr.pol-row', root);
+				if (!rows.length) return;
+
+				btnAll.disabled = true;
+				try{
+					const items = rows.map(tr => ({
+						title:  q('[data-field="title"] .pol-text', tr)?.textContent?.trim() || '',
+						author: q('[data-field="author"] .pol-text', tr)?.textContent?.trim() || '',
+						year:   (q('.pol-year-text', tr)?.textContent || '').match(/^\d{3,4}$/) ? parseInt(q('.pol-year-text', tr).textContent,10) : null,
+						id:     parseInt(tr.dataset.id || '0', 10)
+					}));
+					const fd = new FormData();
+					fd.append('action','politeia_buttons_confirm_all'); // ya existente
+					fd.append('nonce', NONCE);
+					fd.append('items', JSON.stringify(items));
+					const resp = await postFD(fd);
+					if (resp && resp.success){
+						// limpia todo
+						const tbody = q('#pol-table tbody');
+						if (tbody) tbody.innerHTML = '<tr><td colspan="4">No pending candidates.</td></tr>';
+						setCount(0);
+					} else {
+						alert('Error confirming all.');
+						btnAll.disabled = false;
+						console.warn(resp);
+					}
+				} catch(e){
+					alert('Network error.');
+					btnAll.disabled = false;
+					console.error(e);
+				}
+			});
+		}
+
+		// -------- Refresh cuando el input encola nuevos ítems --------
+		window.addEventListener('politeia:queue-updated', () => {
+			// refrescar por simplicidad
+			location.reload();
+		});
+
+		// inicial
+		lookupYearsForVisible();
+	})();
+	</script>
+	<?php
+	return ob_get_clean();
 }
 add_shortcode('politeia_confirm_table', 'politeia_confirm_table_shortcode');
-
-
-/**
- * Endpoint de refresco (usado por el JS de arriba).
- * Devuelve los pendientes del usuario logueado.
- */
-function politeia_confirm_table_fetch_ajax(){
-    try {
-        check_ajax_referer('politeia-chatgpt-nonce','nonce');
-        if ( ! is_user_logged_in() ) {
-            wp_send_json_success(['items'=>[]]); // vacío si no logueado
-        }
-        global $wpdb;
-        $uid  = get_current_user_id();
-        $tbl  = $wpdb->prefix . 'politeia_book_confirm';
-        $rows = $wpdb->get_results(
-            $wpdb->prepare(
-                "SELECT id, title, author
-                   FROM {$tbl}
-                  WHERE user_id=%d AND status='pending'
-                  ORDER BY id DESC
-                  LIMIT 200",
-                $uid
-            ),
-            ARRAY_A
-        );
-        wp_send_json_success(['items' => $rows ?: []]);
-    } catch (Throwable $e){
-        if ( defined('WP_DEBUG') && WP_DEBUG ) {
-            wp_send_json_error($e->getMessage());
-        }
-        wp_send_json_error('error');
-    }
-}
-add_action('wp_ajax_politeia_confirm_table_fetch', 'politeia_confirm_table_fetch_ajax');
-add_action('wp_ajax_nopriv_politeia_confirm_table_fetch', 'politeia_confirm_table_fetch_ajax'); // si quieres permitir visitantes
