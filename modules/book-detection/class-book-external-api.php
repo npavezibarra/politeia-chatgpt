@@ -1,25 +1,22 @@
 <?php
 /**
  * Class: Politeia_Book_External_API
- * Purpose: Query external book sources (Open Library, Google Books) to find a best match
- *          for a given (title, author). Returns a single best candidate or null if none
- *          reaches the similarity threshold.
- * Language: English (all user-facing strings are translatable via the 'politeia-chatgpt' text domain).
+ * Purpose: Query external book sources (Open Library, Google Books) to find the
+ *          best match for a given (title, author). Always maps provider fields
+ *          to a common shape and extracts a usable publication year.
  *
- * Usage (example):
- *   $ext = new Politeia_Book_External_API(); // or new Politeia_Book_External_API('YOUR_GOOGLE_API_KEY')
- *   $match = $ext->search_best_match( 'The Hobbit', 'J.R.R. Tolkien' );
- *   if ( $match ) {
- *       // $match is an array: ['title','author','isbn','source','score']
- *   }
- *
- * Notes:
- * - No tables are created here. This is a pure HTTP/aggregation utility.
- * - Google Books API key is optional; if omitted, requests may still work within public quota.
- * - Threshold and enabled providers are filterable (see filters below).
+ * Returned candidate shape:
+ * [
+ *   'title'  => (string),
+ *   'author' => (string),
+ *   'isbn'   => (string|null),
+ *   'source' => 'openlibrary'|'googlebooks',
+ *   'year'   => (int|null),   // derived from provider-specific fields
+ *   'score'  => (float)       // 0..100 similarity to the requested title/author
+ * ]
  *
  * Filters:
- * - 'politeia_book_external_min_score' (int)    Default 62 (0..100), minimum similarity score to accept a match.
+ * - 'politeia_book_external_min_score' (int)    Default 62 (0..100). Minimum score to accept a match.
  * - 'politeia_book_external_providers' (array)  Default ['openlibrary','googlebooks'].
  */
 
@@ -40,7 +37,8 @@ class Politeia_Book_External_API {
     protected $providers = [ 'openlibrary', 'googlebooks' ];
 
     /**
-     * @param string|null $google_api_key  Optional Google Books API key. If null, tries WP option 'politeia_google_books_api_key'.
+     * @param string|null $google_api_key  Optional Google Books API key.
+     *                                     If null, uses WP option 'politeia_google_books_api_key' if present.
      */
     public function __construct( $google_api_key = null ) {
         $this->google_api_key = $google_api_key;
@@ -51,7 +49,7 @@ class Politeia_Book_External_API {
             }
         }
 
-        // Allow site owners to tune behavior.
+        // Allow customization via filters
         $this->min_score = (int) apply_filters( 'politeia_book_external_min_score', $this->min_score );
         $providers = apply_filters( 'politeia_book_external_providers', $this->providers );
         if ( is_array( $providers ) && ! empty( $providers ) ) {
@@ -59,104 +57,80 @@ class Politeia_Book_External_API {
         }
     }
 
-    /**
-     * Public getter for current threshold (useful for UIs).
-     */
-    public function get_min_score() {
-        return $this->min_score;
-    }
+    /** Public getter for current threshold. */
+    public function get_min_score() { return $this->min_score; }
+
+    /** Public getter for enabled providers. */
+    public function get_providers() { return $this->providers; }
 
     /**
-     * Public getter for enabled providers.
-     */
-    public function get_providers() {
-        return $this->providers;
-    }
-
-    /**
-     * Main entry: find best external candidate for (title, author).
+     * Find best external candidate for (title, author).
      *
      * @param string $title
      * @param string $author
-     * @param array  $args {
-     *   @type int    $limit_per_provider  How many candidates to fetch per provider. Default 5.
-     * }
-     * @return array|null Best candidate or null if none acceptable.
-     *
-     * Returned array shape:
-     *   [
-     *     'title'  => (string),
-     *     'author' => (string),
-     *     'isbn'   => (string|null),
-     *     'source' => (string) 'openlibrary' | 'googlebooks',
-     *     'score'  => (float)  0..100 similarity score
-     *   ]
+     * @param array  $args { @type int $limit_per_provider Default 5 }
+     * @return array|null Candidate (see header) or null if none meets threshold.
      */
     public function search_best_match( $title, $author, $args = [] ) {
         $limit = isset( $args['limit_per_provider'] ) ? (int) $args['limit_per_provider'] : 5;
         if ( $limit <= 0 ) $limit = 5;
 
-        $nt = $this->normalize( $title );
-        $na = $this->normalize( $author );
+        $target_title_norm  = $this->normalize( $title );
+        $target_author_norm = $this->normalize( $author );
 
         $candidates = [];
 
         foreach ( $this->providers as $provider ) {
             if ( $provider === 'openlibrary' ) {
-                $candidates = array_merge( $candidates, $this->search_openlibrary( $title, $author, $limit ) );
+                $candidates = array_merge(
+                    $candidates,
+                    $this->search_openlibrary( $title, $author, $limit )
+                );
             } elseif ( $provider === 'googlebooks' ) {
-                $candidates = array_merge( $candidates, $this->search_googlebooks( $title, $author, $limit ) );
+                $candidates = array_merge(
+                    $candidates,
+                    $this->search_googlebooks( $title, $author, $limit )
+                );
             }
         }
 
-        if ( empty( $candidates ) ) {
-            return null;
-        }
+        if ( empty( $candidates ) ) return null;
 
-        // Deduplicate by normalized (title|author)
+        // De-duplicate by normalized (title|author) keeping highest score
         $dedup = [];
         foreach ( $candidates as $cand ) {
             $key = $this->normalize( $cand['title'] ) . '|' . $this->normalize( $cand['author'] );
-            // Keep the one with the higher score
             if ( ! isset( $dedup[ $key ] ) || $cand['score'] > $dedup[ $key ]['score'] ) {
                 $dedup[ $key ] = $cand;
             }
         }
 
-        // Compute final scores relative to requested (title, author)
-        $best = null;
-        $best_score = -1;
-
+        // Final scoring vs requested (title, author)
+        $best = null; $best_score = -1;
         foreach ( $dedup as $cand ) {
-            // Re-score against target to ensure consistency
-            $score = $this->score( $this->normalize( $cand['title'] ), $this->normalize( $cand['author'] ), $nt, $na );
+            $score = $this->score(
+                $this->normalize( $cand['title'] ),
+                $this->normalize( $cand['author'] ),
+                $target_title_norm,
+                $target_author_norm
+            );
             $cand['score'] = $score;
-
-            if ( $score > $best_score ) {
-                $best_score = $score;
-                $best = $cand;
-            }
+            if ( $score > $best_score ) { $best_score = $score; $best = $cand; }
         }
 
-        if ( $best && $best['score'] >= $this->min_score ) {
-            return $best;
-        }
-
+        if ( $best && $best['score'] >= $this->min_score ) return $best;
         return null;
     }
 
-    /* ------------------------------------------------------------------
+    /* ======================================================================
      * Providers
-     * ------------------------------------------------------------------ */
+     * ====================================================================== */
 
     /**
-     * Query Open Library Search API.
-     * API: https://openlibrary.org/search.json?title=...&author=...&limit=...
+     * Open Library Search API:
+     *   https://openlibrary.org/search.json?title=...&author=...&limit=...
      *
-     * @param string $title
-     * @param string $author
-     * @param int    $limit
-     * @return array<int,array> candidates
+     * @return array<int,array> candidates in common shape (includes 'year')
      */
     protected function search_openlibrary( $title, $author, $limit = 5 ) {
         $url = add_query_arg(
@@ -169,15 +143,10 @@ class Politeia_Book_External_API {
         );
 
         $resp = $this->http_get( $url );
-        if ( is_wp_error( $resp ) ) {
-            return [];
-        }
+        if ( is_wp_error( $resp ) ) return [];
 
-        $body = wp_remote_retrieve_body( $resp );
-        $json = json_decode( $body, true );
-        if ( ! is_array( $json ) || empty( $json['docs'] ) ) {
-            return [];
-        }
+        $json = json_decode( wp_remote_retrieve_body( $resp ), true );
+        if ( ! is_array( $json ) || empty( $json['docs'] ) ) return [];
 
         $results = [];
         $nt = $this->normalize( $title );
@@ -190,6 +159,7 @@ class Politeia_Book_External_API {
             } elseif ( isset( $doc['title_suggest'] ) && is_string( $doc['title_suggest'] ) ) {
                 $t = $doc['title_suggest'];
             }
+            if ( $t === '' ) continue;
 
             $a = '';
             if ( isset( $doc['author_name'][0] ) ) {
@@ -198,21 +168,21 @@ class Politeia_Book_External_API {
                 $a = (string) $doc['author_alternative_name'][0];
             }
 
-            if ( $t === '' ) {
-                continue; // must have a title
+            // Year mapping: prefer first_publish_year then first publish_year entry
+            $year = null;
+            if ( ! empty( $doc['first_publish_year'] ) ) {
+                $year = (int) $doc['first_publish_year'];
+            } elseif ( ! empty( $doc['publish_year'][0] ) ) {
+                $year = (int) $doc['publish_year'][0];
             }
 
             $isbn = null;
             if ( ! empty( $doc['isbn'] ) && is_array( $doc['isbn'] ) ) {
-                // Prefer a 13-digit if present
                 foreach ( $doc['isbn'] as $i ) {
                     $i = (string) $i;
                     if ( preg_match( '/^\d{13}$/', $i ) ) { $isbn = $i; break; }
                 }
-                if ( $isbn === null ) {
-                    // fallback: take first
-                    $isbn = (string) $doc['isbn'][0];
-                }
+                if ( $isbn === null ) $isbn = (string) $doc['isbn'][0];
             }
 
             $score = $this->score( $this->normalize( $t ), $this->normalize( $a ), $nt, $na );
@@ -222,6 +192,7 @@ class Politeia_Book_External_API {
                 'author' => $a,
                 'isbn'   => $isbn,
                 'source' => 'openlibrary',
+                'year'   => $year ?: null,
                 'score'  => $score,
             ];
         }
@@ -230,78 +201,63 @@ class Politeia_Book_External_API {
     }
 
     /**
-     * Query Google Books API.
-     * API: https://www.googleapis.com/books/v1/volumes?q=intitle:...+inauthor:...&maxResults=...&key=API_KEY
+     * Google Books API:
+     *   https://www.googleapis.com/books/v1/volumes?q=intitle:...+inauthor:...&maxResults=...&key=API_KEY
      *
-     * @param string $title
-     * @param string $author
-     * @param int    $limit
-     * @return array<int,array> candidates
+     * @return array<int,array> candidates in common shape (includes 'year')
      */
     protected function search_googlebooks( $title, $author, $limit = 5 ) {
-        // Build query
         $q_parts = [];
         if ( $title !== '' )  $q_parts[] = 'intitle:' . $title;
         if ( $author !== '' ) $q_parts[] = 'inauthor:' . $author;
 
         $args = [
             'q'          => implode( ' ', $q_parts ),
-            'maxResults' => $limit,
-            // 'langRestrict' => 'es', // optionally restrict language
+            'maxResults' => max(1, min(10, (int)$limit) ),
+            // You may restrict language if you wish:
+            // 'langRestrict' => 'es',
+            'printType'  => 'books',
         ];
-
-        if ( $this->google_api_key && is_string( $this->google_api_key ) ) {
-            $args['key'] = $this->google_api_key;
-        }
+        if ( $this->google_api_key ) $args['key'] = $this->google_api_key;
 
         $url  = add_query_arg( $args, 'https://www.googleapis.com/books/v1/volumes' );
         $resp = $this->http_get( $url );
-        if ( is_wp_error( $resp ) ) {
-            return [];
-        }
+        if ( is_wp_error( $resp ) ) return [];
 
-        $body = wp_remote_retrieve_body( $resp );
-        $json = json_decode( $body, true );
-        if ( ! is_array( $json ) || empty( $json['items'] ) ) {
-            return [];
-        }
+        $json = json_decode( wp_remote_retrieve_body( $resp ), true );
+        if ( ! is_array( $json ) || empty( $json['items'] ) ) return [];
 
         $results = [];
         $nt = $this->normalize( $title );
         $na = $this->normalize( $author );
 
         foreach ( (array) $json['items'] as $item ) {
-            if ( empty( $item['volumeInfo'] ) || ! is_array( $item['volumeInfo'] ) ) {
-                continue;
-            }
-            $vi = $item['volumeInfo'];
+            $vi = $item['volumeInfo'] ?? null;
+            if ( ! is_array( $vi ) ) continue;
 
             $t = isset( $vi['title'] ) ? (string) $vi['title'] : '';
             if ( $t === '' ) continue;
 
             $a = '';
-            if ( ! empty( $vi['authors'][0] ) ) {
-                $a = (string) $vi['authors'][0];
-            }
+            if ( ! empty( $vi['authors'][0] ) ) $a = (string) $vi['authors'][0];
 
+            // Prefer ISBN_13 if present
             $isbn = null;
             if ( ! empty( $vi['industryIdentifiers'] ) && is_array( $vi['industryIdentifiers'] ) ) {
-                // Prefer ISBN_13
                 foreach ( $vi['industryIdentifiers'] as $id ) {
                     if ( isset( $id['type'], $id['identifier'] ) && $id['type'] === 'ISBN_13' ) {
-                        $isbn = (string) $id['identifier'];
-                        break;
+                        $isbn = (string) $id['identifier']; break;
                     }
                 }
                 if ( $isbn === null ) {
                     foreach ( $vi['industryIdentifiers'] as $id ) {
-                        if ( isset( $id['identifier'] ) ) {
-                            $isbn = (string) $id['identifier'];
-                            break;
-                        }
+                        if ( isset( $id['identifier'] ) ) { $isbn = (string) $id['identifier']; break; }
                     }
                 }
             }
+
+            // Extract year from any publishedDate form (YYYY, YYYY-MM, YYYY-MM-DD)
+            $year = $this->extract_year( $vi['publishedDate'] ?? null );
 
             $score = $this->score( $this->normalize( $t ), $this->normalize( $a ), $nt, $na );
 
@@ -310,6 +266,7 @@ class Politeia_Book_External_API {
                 'author' => $a,
                 'isbn'   => $isbn,
                 'source' => 'googlebooks',
+                'year'   => $year,
                 'score'  => $score,
             ];
         }
@@ -317,32 +274,27 @@ class Politeia_Book_External_API {
         return $results;
     }
 
-    /* ------------------------------------------------------------------
-     * Helpers
-     * ------------------------------------------------------------------ */
+    /* ======================================================================
+     * Utils
+     * ====================================================================== */
 
-    /**
-     * Normalize free text (strip tags, trim, remove accents, lowercase, keep basic chars, collapse spaces).
-     */
+    /** Normalize text: strip tags, remove accents, lowercase, collapse spaces. */
     protected function normalize( $text ) {
         $t = (string) $text;
         $t = wp_strip_all_tags( $t );
         $t = trim( $t );
         $t = remove_accents( $t );
         $t = mb_strtolower( $t, 'UTF-8' );
-        $t = preg_replace( '/[^a-z0-9\s\-\_\'\":]+/u', ' ', $t );
         $t = preg_replace( '/\s+/u', ' ', $t );
         return trim( $t );
     }
 
     /**
-     * Similarity score between candidate and target (0..100), weighted title 60% / author 40%.
-     *
+     * Similarity score (0..100), weighted title 60% / author 40%.
      * @param string $cand_title_norm
      * @param string $cand_author_norm
      * @param string $target_title_norm
      * @param string $target_author_norm
-     * @return float
      */
     protected function score( $cand_title_norm, $cand_author_norm, $target_title_norm, $target_author_norm ) {
         $st = 0.0; $sa = 0.0;
@@ -351,9 +303,15 @@ class Politeia_Book_External_API {
         return (0.6 * $st) + (0.4 * $sa);
     }
 
+    /** Extracts a 4-digit year from various date formats. */
+    protected function extract_year( $val ) {
+        if ( ! $val ) return null;
+        if ( preg_match( '/\d{4}/', (string) $val, $m ) ) return (int) $m[0];
+        return null;
+    }
+
     /**
      * HTTP GET wrapper with sane defaults.
-     *
      * @param string $url
      * @return array|\WP_Error Response from wp_remote_get()
      */
@@ -362,13 +320,12 @@ class Politeia_Book_External_API {
             'timeout' => 15,
             'headers' => [
                 'Accept'     => 'application/json',
-                'User-Agent' => 'PoliteiaChatGPT/1.0; (+WP)' // polite UA
+                'User-Agent' => 'PoliteiaChatGPT/1.0 (+WordPress)',
             ],
         ];
         $resp = wp_remote_get( esc_url_raw( $url ), $args );
-        if ( is_wp_error( $resp ) ) {
-            return $resp;
-        }
+        if ( is_wp_error( $resp ) ) return $resp;
+
         $code = (int) wp_remote_retrieve_response_code( $resp );
         if ( $code < 200 || $code >= 300 ) {
             return new \WP_Error(
