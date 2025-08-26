@@ -69,7 +69,7 @@ class Politeia_Book_Confirm_Schema {
             created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (id),
-            UNIQUE KEY uq_user_hash_status (user_id, title_author_hash, status),
+            UNIQUE KEY uq_user_status_hash (user_id, status, title_author_hash),
             KEY idx_user_status (user_id, status),
             KEY idx_hash (title_author_hash),
             KEY idx_matched (matched_book_id)

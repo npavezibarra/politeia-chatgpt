@@ -1,229 +1,285 @@
 <?php
-// modules/shortcode/confirm-table-shortcode.php
-if ( ! defined('ABSPATH') ) exit;
-
 /**
  * Shortcode: [politeia_confirm_table]
- * - Muestra los candidatos pendientes del usuario desde wp_politeia_book_confirm
- * - Consulta el año vía AJAX (politeia_lookup_book_years)
- * - Permite Confirm y Confirm All (politeia_buttons_confirm / _all)
+ * Muestra los libros pendientes desde wp_politeia_book_confirm (status='pending')
+ * del usuario actual. Renderiza server–side para que se vean siempre, y agrega
+ * JS mínimo para Confirm / Confirm All y refresco opcional.
  */
-add_action('init', function () {
-    add_shortcode('politeia_confirm_table', 'politeia_confirm_table_shortcode');
-});
 
-function politeia_confirm_table_shortcode( $atts = [] ) {
+if ( ! defined('ABSPATH') ) exit;
+
+function politeia_confirm_table_shortcode() {
     if ( ! is_user_logged_in() ) {
-        return '<p>'.esc_html__('You must be logged in to manage your library.', 'politeia-chatgpt').'</p>';
+        return '<p>Debes iniciar sesión para ver tus libros pendientes.</p>';
     }
 
     global $wpdb;
-    $user_id = get_current_user_id();
-    $tbl     = $wpdb->prefix . 'politeia_book_confirm';
-
-    // Obtiene los "pending" del usuario (limit por seguridad)
-    $rows = $wpdb->get_results(
+    $uid        = get_current_user_id();
+    $tbl        = $wpdb->prefix . 'politeia_book_confirm';
+    $items      = $wpdb->get_results(
         $wpdb->prepare(
             "SELECT id, title, author
                FROM {$tbl}
               WHERE user_id=%d AND status='pending'
-              ORDER BY id ASC
+              ORDER BY id DESC
               LIMIT 200",
-            $user_id
+            $uid
         ),
         ARRAY_A
     );
+    $count      = is_array($items) ? count($items) : 0;
 
-    // Lista de items para lookup de año y confirm
-    $items = array_map(function($r){
-        return [
-            'title'  => (string) $r['title'],
-            'author' => (string) $r['author'],
-        ];
-    }, (array) $rows);
-
-    $json_items = wp_json_encode($items);
-    $ajaxurl    = admin_url('admin-ajax.php');
-    $nonce      = wp_create_nonce('politeia-chatgpt-nonce');
-    $uid        = 'pct_' . ( function_exists('wp_generate_uuid4') ? wp_generate_uuid4() : uniqid() );
+    // Nonce para AJAX (usamos el mismo que en el resto del plugin)
+    $nonce = wp_create_nonce('politeia-chatgpt-nonce');
+    $ajax  = admin_url('admin-ajax.php');
 
     ob_start();
     ?>
-    <div id="<?php echo esc_attr($uid); ?>" class="politeia-confirm-wrapper">
-        <div class="politeia-status" data-pct="status"></div>
-
-        <div class="politeia-confirm-card">
-            <div class="politeia-confirm-card__header">
-                <h3 class="politeia-title">
-                    <?php
-                    printf(
-                        /* translators: %d = count of candidates */
-                        esc_html__('Queued candidates: %d', 'politeia-chatgpt'),
-                        count($rows)
-                    );
-                    ?>
-                </h3>
-                <button class="pol-btn pol-btn-primary" data-pct="confirm-all">
-                    <?php echo esc_html__('Confirm All', 'politeia-chatgpt'); ?>
-                </button>
-            </div>
-
-            <div class="politeia-table-wrap">
-                <table class="politeia-table" data-pct="table">
-                    <thead>
-                        <tr>
-                            <th><?php echo esc_html__('Title', 'politeia-chatgpt'); ?></th>
-                            <th><?php echo esc_html__('Author', 'politeia-chatgpt'); ?></th>
-                            <th style="width:100px"><?php echo esc_html__('Year', 'politeia-chatgpt'); ?></th>
-                            <th style="width:140px"></th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                    <?php if ( $rows ) : ?>
-                        <?php foreach ( $rows as $r ) : ?>
-                            <tr data-title="<?php echo esc_attr($r['title']); ?>"
-                                data-author="<?php echo esc_attr($r['author']); ?>">
-                                <td class="pct-title"><?php echo esc_html($r['title']); ?></td>
-                                <td class="pct-author"><?php echo esc_html($r['author']); ?></td>
-                                <td class="pct-year">…</td>
-                                <td class="pct-actions">
-                                    <button class="pol-btn pol-btn-ghost" data-pct="confirm">
-                                        <?php echo esc_html__('Confirm', 'politeia-chatgpt'); ?>
-                                    </button>
-                                </td>
-                            </tr>
-                        <?php endforeach; ?>
-                    <?php else : ?>
-                        <tr><td colspan="4"><?php echo esc_html__('No pending candidates.', 'politeia-chatgpt'); ?></td></tr>
-                    <?php endif; ?>
-                    </tbody>
-                </table>
-            </div>
-        </div>
-    </div>
-
     <style>
-        .politeia-confirm-card {
-            background:#fff; border-radius:14px; padding:14px 16px; box-shadow:0 6px 20px rgba(0,0,0,.06);
-        }
-        .politeia-confirm-card__header {
-            display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;
-        }
-        .politeia-title { margin:0; font-weight:600; }
-        .politeia-table { width:100%; border-collapse:collapse; }
-        .politeia-table th, .politeia-table td { padding:14px 16px; border-top:1px solid #eee; }
-        .politeia-table th { text-align:left; }
-        .politeia-status { text-align:center; margin:8px 0 12px; color:#333; }
-        .pol-btn { padding:10px 16px; border-radius:12px; border:1px solid #e6e6e6; background:#f7f7f7; cursor:pointer; }
-        .pol-btn-primary { background:#1a73e8; color:#fff; border-color:#1a73e8; }
-        .pol-btn-ghost { background:#fafafa; }
-        tr.pct-confirmed { opacity:.5; }
+      .pol-confirm-card{background:#fff;border-radius:14px;padding:14px 16px;box-shadow:0 6px 20px rgba(0,0,0,.06);margin:16px 0}
+      .pol-confirm-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+      .pol-confirm-title{margin:0;font-weight:600}
+      .pol-confirm-table{width:100%;border-collapse:collapse}
+      .pol-confirm-table th,.pol-confirm-table td{padding:14px 16px;border-top:1px solid #eee;text-align:left}
+      .pol-btn{padding:10px 16px;border-radius:12px;border:1px solid #e6e6e6;background:#f7f7f7;cursor:pointer}
+      .pol-btn-primary{background:#1a73e8;color:#fff;border-color:#1a73e8}
+      .pol-btn[disabled]{opacity:.6;cursor:not-allowed}
+      .pol-muted{opacity:.55}
     </style>
+
+    <div class="pol-confirm-card" id="pol-confirm-card"
+         data-ajax="<?php echo esc_url($ajax); ?>"
+         data-nonce="<?php echo esc_attr($nonce); ?>">
+      <div class="pol-confirm-head">
+        <h3 class="pol-confirm-title">
+          Queued candidates: <span id="pol-confirm-count"><?php echo (int)$count; ?></span>
+        </h3>
+        <button class="pol-btn pol-btn-primary" id="pol-confirm-all-btn">Confirm All</button>
+      </div>
+
+      <div class="pol-confirm-table-wrap">
+        <table class="pol-confirm-table">
+          <thead>
+            <tr>
+              <th style="width:44%">Title</th>
+              <th style="width:36%">Author</th>
+              <th style="width:10%">Year</th>
+              <th style="width:10%"></th>
+            </tr>
+          </thead>
+          <tbody id="pol-confirm-tbody">
+            <?php if ($count === 0): ?>
+              <tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>
+            <?php else: foreach ($items as $row): ?>
+              <tr data-id="<?php echo (int)$row['id']; ?>"
+                  data-title="<?php echo esc_attr($row['title']); ?>"
+                  data-author="<?php echo esc_attr($row['author']); ?>">
+                <td><?php echo esc_html($row['title']); ?></td>
+                <td><?php echo esc_html($row['author']); ?></td>
+                <td class="pol-year">…</td>
+                <td>
+                  <button class="pol-btn" data-pol-confirm>Confirm</button>
+                </td>
+              </tr>
+            <?php endforeach; endif; ?>
+          </tbody>
+        </table>
+      </div>
+    </div>
 
     <script>
     (function(){
-        const root    = document.getElementById('<?php echo esc_js($uid); ?>');
-        if(!root) return;
+      const card   = document.getElementById('pol-confirm-card');
+      const tbody  = document.getElementById('pol-confirm-tbody');
+      const btnAll = document.getElementById('pol-confirm-all-btn');
+      const countE = document.getElementById('pol-confirm-count');
+      const AJAX   = card?.dataset.ajax || '';
+      const NONCE  = card?.dataset.nonce || '';
 
-        const ajaxurl = '<?php echo esc_url( $ajaxurl ); ?>';
-        const nonce   = '<?php echo esc_js( $nonce ); ?>';
-        const items   = <?php echo $json_items ? $json_items : '[]'; ?>;
+      const qs  = (sel,root=document)=>root.querySelector(sel);
+      const qsa = (sel,root=document)=>Array.from(root.querySelectorAll(sel));
 
-        const statusEl = root.querySelector('[data-pct="status"]');
-        const tbody    = root.querySelector('tbody');
-        const btnAll   = root.querySelector('[data-pct="confirm-all"]');
+      function rows(){ return qsa('tr[data-id]', tbody); }
+      function leftCount(){ return rows().length; }
+      function updateCount(){ if(countE) countE.textContent = String(leftCount()); }
 
-        function setStatus(msg){ if(statusEl) statusEl.textContent = msg || ''; }
-        async function postFD(fd){
-            const res = await fetch(ajaxurl, { method:'POST', body: fd });
-            try { return await res.clone().json(); }
-            catch(e){ return { success:false, data: await res.text() }; }
-        }
-        function rowToItem(tr){
-            const y = tr.dataset.year ? parseInt(tr.dataset.year,10) : null;
-            return {
-                title:  tr.dataset.title  || tr.querySelector('.pct-title')?.textContent || '',
-                author: tr.dataset.author || tr.querySelector('.pct-author')?.textContent || '',
-                year:   Number.isInteger(y) ? y : null
-            };
-        }
+      function rowToItem(tr){
+        const id     = parseInt(tr.dataset.id,10);
+        const title  = tr.dataset.title || qs('td:nth-child(1)', tr)?.textContent || '';
+        const author = tr.dataset.author|| qs('td:nth-child(2)', tr)?.textContent || '';
+        const ytxt   = qs('.pol-year', tr)?.textContent || '';
+        const y      = /^\d{3,4}$/.test(ytxt.trim()) ? parseInt(ytxt,10) : null;
+        return { id, title, author, year: y };
+      }
 
-        // 1) Lookup de años
-        if(items.length){
-            setStatus('<?php echo esc_js(__('Looking up years…', 'politeia-chatgpt')); ?>');
-            const fd = new FormData();
-            fd.append('action','politeia_lookup_book_years');
-            fd.append('nonce', nonce);
-            fd.append('items', JSON.stringify(items));
-            postFD(fd).then(resp=>{
-                if(resp && resp.success && resp.data && Array.isArray(resp.data.years)){
-                    const years = resp.data.years;
-                    [...tbody.querySelectorAll('tr')].forEach((tr,i)=>{
-                        const y = years[i];
-                        tr.dataset.year = (Number.isInteger(y) ? String(y) : '');
-                        const cell = tr.querySelector('.pct-year');
-                        if(cell) cell.textContent = (Number.isInteger(y) ? String(y) : '…');
-                    });
-                    setStatus('');
-                } else {
-                    setStatus('<?php echo esc_js(__('Year lookup failed.', 'politeia-chatgpt')); ?>');
-                }
-            }).catch(e=> setStatus('Error: '+ e));
-        }
+      async function postFD(fd){
+        const res = await fetch(AJAX, { method:'POST', body:fd });
+        try { return await res.clone().json(); }
+        catch { return { success:false, data: await res.text() }; }
+      }
 
-        // 2) Confirm individual
-        tbody.addEventListener('click', async (ev)=>{
-            const btn = ev.target.closest('button[data-pct="confirm"]');
-            if(!btn) return;
-            const tr = btn.closest('tr'); if(!tr) return;
-
-            btn.disabled = true; setStatus('<?php echo esc_js(__('Confirming…', 'politeia-chatgpt')); ?>');
-            const fd = new FormData();
-            fd.append('action','politeia_buttons_confirm');
-            fd.append('nonce', nonce);
-            fd.append('items', JSON.stringify([rowToItem(tr)]));
-
-            const resp = await postFD(fd);
-            if(resp && resp.success){
-                tr.classList.add('pct-confirmed');
-                setStatus('<?php echo esc_js(__('Confirmed.', 'politeia-chatgpt')); ?>');
-            } else {
-                btn.disabled = false;
-                setStatus('<?php echo esc_js(__('Error confirming.', 'politeia-chatgpt')); ?>');
-                console.error('[Politeia Confirm]', resp);
-            }
-        });
-
-        // 3) Confirm All
-        if(btnAll){
-            btnAll.addEventListener('click', async ()=>{
-                const list = [...tbody.querySelectorAll('tr:not(.pct-confirmed)')].map(tr=>rowToItem(tr));
-                if(!list.length){ setStatus('<?php echo esc_js(__('Nothing to confirm.', 'politeia-chatgpt')); ?>'); return; }
-
-                btnAll.disabled = true; setStatus('<?php echo esc_js(__('Confirming all…', 'politeia-chatgpt')); ?>');
-                const fd = new FormData();
-                fd.append('action','politeia_buttons_confirm_all');
-                fd.append('nonce', nonce);
-                fd.append('items', JSON.stringify(list));
-
-                const resp = await postFD(fd);
-                if (resp && resp.success) {
-                const confirmedCount =
-                    resp.data && Number.isInteger(resp.data.confirmed)
-                    ? resp.data.confirmed
-                    : list.length;
-
-                [...tbody.querySelectorAll('tr')].forEach(tr => tr.remove());
-                setStatus(`All confirmed: ${confirmedCount}.`);
-                } else {
-                btnAll.disabled = false;
-                setStatus('Error confirming all.');
-                console.error('[Politeia Confirm All]', resp);
-                }
+      // ---- Lookup de años (OpenLibrary/Google) para las filas visibles
+      async function lookupYears(){
+        const list = rows().map(rowToItem);
+        if (!list.length) return;
+        try{
+          const fd = new FormData();
+          fd.append('action','politeia_lookup_book_years');
+          fd.append('nonce', NONCE);
+          fd.append('items', JSON.stringify(list));
+          const resp = await postFD(fd);
+          if (resp && resp.success && resp.data && Array.isArray(resp.data.years)) {
+            rows().forEach((tr, i) => {
+              const cell = qs('.pol-year', tr);
+              const y    = resp.data.years[i];
+              if (cell) cell.textContent = Number.isInteger(y) ? String(y) : '—';
             });
+          } else {
+            // Muestra guiones si falla
+            rows().forEach(tr => { const c = qs('.pol-year',tr); if(c) c.textContent = '—'; });
+          }
+        } catch {
+          rows().forEach(tr => { const c = qs('.pol-year',tr); if(c) c.textContent = '—'; });
         }
+      }
+
+      // ---- Confirm individual
+      tbody.addEventListener('click', async (ev)=>{
+        const btn = ev.target.closest('button[data-pol-confirm]');
+        if (!btn) return;
+        const tr = btn.closest('tr'); if (!tr) return;
+        btn.disabled = true;
+
+        try{
+          const fd = new FormData();
+          fd.append('action','politeia_buttons_confirm');
+          fd.append('nonce', NONCE);
+          fd.append('items', JSON.stringify([rowToItem(tr)]));
+          const resp = await postFD(fd);
+          if (resp && resp.success){
+            tr.remove();
+            if (!rows().length) tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
+            updateCount();
+          } else {
+            btn.disabled = false;
+            console.error('[Confirm] error', resp);
+          }
+        } catch(e){
+          btn.disabled = false;
+          console.error(e);
+        }
+      });
+
+      // ---- Confirm All
+      btnAll.addEventListener('click', async ()=>{
+        const list = rows().map(rowToItem);
+        if (!list.length) return;
+
+        btnAll.disabled = true;
+        try{
+          const fd = new FormData();
+          fd.append('action','politeia_buttons_confirm_all');
+          fd.append('nonce', NONCE);
+          fd.append('items', JSON.stringify(list));
+          const resp = await postFD(fd);
+          if (resp && resp.success){
+            tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
+            updateCount();
+          } else {
+            btnAll.disabled = false;
+            console.error('[Confirm All] error', resp);
+          }
+        } catch(e){
+          btnAll.disabled = false;
+          console.error(e);
+        }
+      });
+
+      // ---- Refresh (opcional): escucha un evento para recargar desde el servidor
+      window.addEventListener('politeia:queue-updated', refreshFromServer);
+
+      async function refreshFromServer(){
+        try{
+          const fd = new FormData();
+          fd.append('action','politeia_confirm_table_fetch');
+          fd.append('nonce', NONCE);
+          const resp = await postFD(fd);
+          if (resp && resp.success && Array.isArray(resp.data?.items)) {
+            renderRows(resp.data.items);
+            updateCount();
+            lookupYears();
+          }
+        } catch(e){ console.error('[Refresh] error', e); }
+      }
+
+      function renderRows(items){
+        if (!items.length){
+          tbody.innerHTML = '<tr class="pol-empty"><td colspan="4">No pending candidates.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = items.map(it => `
+          <tr data-id="${Number(it.id)}"
+              data-title="${escapeHtml(it.title)}"
+              data-author="${escapeHtml(it.author)}">
+            <td>${escapeHtml(it.title)}</td>
+            <td>${escapeHtml(it.author)}</td>
+            <td class="pol-year">…</td>
+            <td><button class="pol-btn" data-pol-confirm>Confirm</button></td>
+          </tr>
+        `).join('');
+      }
+
+      function escapeHtml(s){
+        return String(s ?? '')
+          .replaceAll('&','&amp;').replaceAll('<','&lt;')
+          .replaceAll('>','&gt;').replaceAll('"','&quot;')
+          .replaceAll("'","&#039;");
+      }
+
+      // Inicial: mirar años para lo que ya está renderizado
+      lookupYears();
+
+      // (Opcional) auto-refresh suave 1 vez a los 1.5s por si justo vienes de subir foto:
+      setTimeout(refreshFromServer, 1500);
     })();
     </script>
     <?php
     return ob_get_clean();
 }
+add_shortcode('politeia_confirm_table', 'politeia_confirm_table_shortcode');
+
+
+/**
+ * Endpoint de refresco (usado por el JS de arriba).
+ * Devuelve los pendientes del usuario logueado.
+ */
+function politeia_confirm_table_fetch_ajax(){
+    try {
+        check_ajax_referer('politeia-chatgpt-nonce','nonce');
+        if ( ! is_user_logged_in() ) {
+            wp_send_json_success(['items'=>[]]); // vacío si no logueado
+        }
+        global $wpdb;
+        $uid  = get_current_user_id();
+        $tbl  = $wpdb->prefix . 'politeia_book_confirm';
+        $rows = $wpdb->get_results(
+            $wpdb->prepare(
+                "SELECT id, title, author
+                   FROM {$tbl}
+                  WHERE user_id=%d AND status='pending'
+                  ORDER BY id DESC
+                  LIMIT 200",
+                $uid
+            ),
+            ARRAY_A
+        );
+        wp_send_json_success(['items' => $rows ?: []]);
+    } catch (Throwable $e){
+        if ( defined('WP_DEBUG') && WP_DEBUG ) {
+            wp_send_json_error($e->getMessage());
+        }
+        wp_send_json_error('error');
+    }
+}
+add_action('wp_ajax_politeia_confirm_table_fetch', 'politeia_confirm_table_fetch_ajax');
+add_action('wp_ajax_nopriv_politeia_confirm_table_fetch', 'politeia_confirm_table_fetch_ajax'); // si quieres permitir visitantes

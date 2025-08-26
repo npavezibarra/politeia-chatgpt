@@ -77,6 +77,7 @@ politeia_chatgpt_safe_require('modules/shortcode/confirm-table-shortcode.php');
 
 // Endpoints AJAX
 politeia_chatgpt_safe_require('modules/book-detection/ajax-book-year-lookup.php');
+politeia_chatgpt_safe_require('modules/book-detection/ajax-confirm-inline-update.php');
 politeia_chatgpt_safe_require('modules/buttons/class-buttons-confirm-controller.php');
 /* -------------------------------------------------------------------------
  * Activación: crear/actualizar tabla wp_politeia_book_confirm
