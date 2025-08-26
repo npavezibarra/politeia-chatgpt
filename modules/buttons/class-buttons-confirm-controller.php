@@ -1,254 +1,260 @@
 <?php
-/**
- * Politeia ChatGPT – Confirm Buttons Controller (self-contained)
- * Location: modules/buttons/class-buttons-confirm-controller.php
- *
- * - Confirma selección (Confirm) y Confirm All
- * - Upsert directo en wp_politeia_books (por title_author_hash)
- * - Enlace en wp_politeia_user_books (UNIQUE user_id,book_id)
- * - Marca wp_politeia_book_confirm.status = 'confirmed'
- * - Devuelve siempre JSON; cualquier fallo queda en debug.log
- */
-
+// modules/buttons/class-buttons-confirm-controller.php
 if ( ! defined('ABSPATH') ) exit;
 
-if ( ! class_exists('Politeia_Buttons_Confirm_Controller') ) :
+/**
+ * AJAX: Confirmar libros (uno o varios).
+ * - Asegura el libro en wp_politeia_books (best-match o inserción)
+ * - Asegura el vínculo en wp_politeia_user_books
+ * - Si todo OK -> elimina el/los pendientes desde wp_politeia_book_confirm
+ *
+ * Requiere que el plugin "Politeia Reading" haya creado sus tablas.
+ */
 
-class Politeia_Buttons_Confirm_Controller {
-
-    /* ----------------- tablas ----------------- */
-    protected static function t_confirm()    { global $wpdb; return $wpdb->prefix . 'politeia_book_confirm'; }
-    protected static function t_books()      { global $wpdb; return $wpdb->prefix . 'politeia_books'; }
-    protected static function t_user_books() { global $wpdb; return $wpdb->prefix . 'politeia_user_books'; }
-
-    /* ----------------- utilidades ----------------- */
-    protected static function norm($s){ return trim( (string)$s ); }
-    protected static function hash_title_author($title,$author){
-        return hash('sha256', strtolower(self::norm($title)).'|'.strtolower(self::norm($author)));
-    }
-    protected static function db_guard(){
-        global $wpdb;
-        if ( ! empty($wpdb->last_error) ) {
-            $e = $wpdb->last_error;
-            $wpdb->last_error = '';
-            throw new Exception('DB error: '.$e);
-        }
-    }
-
-    /* ----------------- upsert libro ----------------- */
-    protected static function ensure_book($title, $author, $year = null){
-        global $wpdb;
-        $table = self::t_books();
-
-        $title  = sanitize_text_field(self::norm($title));
-        $author = sanitize_text_field(self::norm($author));
-        $hash   = self::hash_title_author($title,$author);
-        $year   = is_null($year) ? null : (int)$year;
-
-        // 1) ¿ya existe?
-        $id = $wpdb->get_var( $wpdb->prepare(
-            "SELECT id FROM {$table} WHERE title_author_hash=%s LIMIT 1", $hash
-        ) );
-        if ( $id ) return (int)$id;
-
-        // 2) insertar (puede chocar por UNIQUE si hay carrera)
-        $data = [
-            'title'             => $title,
-            'author'            => $author,
-            'title_author_hash' => $hash,
-            'created_at'        => current_time('mysql', 1),
-            'updated_at'        => current_time('mysql', 1),
-        ];
-        $fmt  = [ '%s','%s','%s','%s','%s' ];
-        if ( ! is_null($year) && $year > 0 ){
-            $data['year'] = $year;
-            $fmt[] = '%d';
-        }
-
-        $wpdb->insert($table, $data, $fmt);
-        // si choca por UNIQUE, intenta recuperar
-        if ( ! empty($wpdb->last_error) ){
-            $dup = stripos($wpdb->last_error, 'Duplicate entry') !== false;
-            if ( ! $dup ) self::db_guard(); // error real
-            $wpdb->last_error = '';
-        }
-
-        $id = $wpdb->insert_id ?: $wpdb->get_var( $wpdb->prepare(
-            "SELECT id FROM {$table} WHERE title_author_hash=%s LIMIT 1", $hash
-        ) );
-        if ( ! $id ) throw new Exception('Could not ensure book.');
-        return (int)$id;
-    }
-
-    /* ----------------- vincular usuario-libro ----------------- */
-    protected static function ensure_user_book($user_id, $book_id){
-        global $wpdb;
-        $table = self::t_user_books();
-
-        // intento de inserción (idempotente por UNIQUE)
-        $wpdb->insert($table, [
-            'user_id'    => (int)$user_id,
-            'book_id'    => (int)$book_id,
-            'created_at' => current_time('mysql', 1),
-            'updated_at' => current_time('mysql', 1),
-        ], ['%d','%d','%s','%s']);
-
-        // ignorar duplicado; propagar otros errores
-        if ( ! empty($wpdb->last_error) ){
-            $dup = stripos($wpdb->last_error, 'Duplicate entry') !== false;
-            if ( ! $dup ) self::db_guard();
-            $wpdb->last_error = '';
-        }
-        return true;
-    }
-
-    /* ----------------- marcar confirmada la fila de cola ----------------- */
-    protected static function mark_confirmed($row_id, $book_id){
-        if ( ! $row_id ) return;
-        global $wpdb;
-        $table = self::t_confirm();
-        $wpdb->update($table, [
-            'status'          => 'confirmed',
-            'matched_book_id' => (int)$book_id,
-            'match_method'    => 'confirmed',
-            'updated_at'      => current_time('mysql', 1),
-        ], [ 'id' => (int)$row_id ], [ '%s','%d','%s','%s' ], [ '%d' ]);
-        self::db_guard();
-    }
-
-    /* ----------------- confirmar 1 item ----------------- */
-    protected static function confirm_item($user_id, $title, $author, $year = null){
-        global $wpdb;
-        $confirm = self::t_confirm();
-
-        $title  = self::norm($title);
-        $author = self::norm($author);
-        if ( $title === '' || $author === '' ) {
-            return [ 'ok'=>false, 'reason'=>'empty_title_author' ];
-        }
-
-        $hash = self::hash_title_author($title,$author);
-
-        // fila pending más reciente (si existe)
-        $row = $wpdb->get_row( $wpdb->prepare(
-            "SELECT id FROM {$confirm}
-             WHERE user_id=%d AND status='pending' AND title_author_hash=%s
-             ORDER BY id DESC LIMIT 1",
-            $user_id, $hash
-        ), ARRAY_A );
-        $row_id = $row ? (int)$row['id'] : null;
-
-        $book_id = self::ensure_book($title, $author, $year);
-        self::ensure_user_book($user_id, $book_id);
-        self::mark_confirmed($row_id, $book_id);
-
-        return [ 'ok'=>true, 'book_id'=>$book_id ];
-    }
-
-    /* ===================== AJAX ===================== */
-
-    public static function ajax_confirm_items(){
-        try{
-            check_ajax_referer('politeia-chatgpt-nonce', 'nonce');
-            if ( ! is_user_logged_in() ) wp_send_json_error('login_required');
-
-            global $wpdb;
-            $wpdb->suppress_errors(false); // mostrar errores SQL
-
-            $items = json_decode( isset($_POST['items']) ? wp_unslash($_POST['items']) : '[]', true );
-            if ( json_last_error() !== JSON_ERROR_NONE || ! is_array($items) ){
-                throw new Exception('Invalid items payload');
-            }
-
-            $user_id = get_current_user_id();
-            $ok = 0; $fail = 0; $per = [];
-
-            foreach ($items as $it){
-                $title  = $it['title']  ?? '';
-                $author = $it['author'] ?? '';
-                $year   = isset($it['year']) ? (int)$it['year'] : null;
-
-                try {
-                    $res = self::confirm_item($user_id, $title, $author, $year);
-                    if ( ! empty($res['ok']) ){ $ok++; $per[] = true; } else { $fail++; $per[] = false; }
-                } catch (Throwable $e){
-                    error_log('[politeia_confirm_items] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
-                    $fail++; $per[] = false;
-                }
-            }
-
-            wp_send_json_success([ 'confirmed'=>$ok, 'failed'=>$fail, 'per_item'=>$per ]);
-
-        } catch (Throwable $e){
-            error_log('[politeia_confirm_items:FATAL] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
-            wp_send_json_error( WP_DEBUG ? $e->getMessage() : 'internal_error' );
-        }
-    }
-
-    public static function ajax_confirm_all(){
-        try{
-            check_ajax_referer('politeia-chatgpt-nonce', 'nonce');
-            if ( ! is_user_logged_in() ) wp_send_json_error('login_required');
-
-            global $wpdb;
-            $wpdb->suppress_errors(false);
-
-            $user_id   = get_current_user_id();
-            $items_raw = isset($_POST['items']) ? wp_unslash($_POST['items']) : '[]';
-            $items     = json_decode($items_raw, true);
-            $use_items = ( json_last_error() === JSON_ERROR_NONE && is_array($items) && !empty($items) );
-
-            $ok = 0; $fail = 0; $per = [];
-
-            if ( $use_items ){
-                foreach ($items as $it){
-                    $title  = $it['title']  ?? '';
-                    $author = $it['author'] ?? '';
-                    $year   = isset($it['year']) ? (int)$it['year'] : null;
-
-                    try {
-                        $res = self::confirm_item($user_id, $title, $author, $year);
-                        if ( ! empty($res['ok']) ){ $ok++; $per[] = true; } else { $fail++; $per[] = false; }
-                    } catch (Throwable $e){
-                        error_log('[politeia_confirm_all:item] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
-                        $fail++; $per[] = false;
-                    }
-                }
-            } else {
-                // Confirmar todo lo pendiente del usuario (con límite de seguridad)
-                $rows = $wpdb->get_results( $wpdb->prepare(
-                    "SELECT id, title, author FROM ".self::t_confirm()."
-                     WHERE user_id=%d AND status='pending'
-                     ORDER BY id ASC LIMIT 200",
-                    $user_id
-                ), ARRAY_A );
-
-                foreach ( (array)$rows as $r ){
-                    try {
-                        $res = self::confirm_item($user_id, $r['title'], $r['author'], null);
-                        if ( ! empty($res['ok']) ) $ok++; else $fail++;
-                    } catch (Throwable $e){
-                        error_log('[politeia_confirm_all:bulk] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
-                        $fail++;
-                    }
-                }
-            }
-
-            wp_send_json_success([ 'confirmed'=>$ok, 'failed'=>$fail, 'per_item'=>$per ]);
-
-        } catch (Throwable $e){
-            error_log('[politeia_confirm_all:FATAL] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
-            wp_send_json_error( WP_DEBUG ? $e->getMessage() : 'internal_error' );
-        }
-    }
+//
+// Carga defensiva de dependencias
+//
+if ( ! class_exists('Politeia_Book_DB_Handler') ) {
+	// Intento 1: vía helper del plugin principal, si existe
+	if ( function_exists('politeia_chatgpt_safe_require') ) {
+		politeia_chatgpt_safe_require('modules/book-detection/class-book-db-handler.php');
+	}
+	// Intento 2: ruta relativa por si se invoca directamente
+	if ( ! class_exists('Politeia_Book_DB_Handler') ) {
+		$maybe = dirname(__DIR__) . '/book-detection/class-book-db-handler.php';
+		if ( file_exists($maybe) ) require_once $maybe;
+	}
 }
 
-/* hooks AJAX (logueados) */
-add_action('wp_ajax_politeia_buttons_confirm',     ['Politeia_Buttons_Confirm_Controller','ajax_confirm_items']);
-add_action('wp_ajax_politeia_buttons_confirm_all', ['Politeia_Buttons_Confirm_Controller','ajax_confirm_all']);
+//
+// Helpers locales para normalizar y hashear igual que la cola
+//
+if ( ! function_exists( 'politeia__normalize_text' ) ) {
+	function politeia__normalize_text( $s ) {
+		$s = (string) $s;
+		$s = wp_strip_all_tags( $s );
+		$s = html_entity_decode( $s, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8' );
+		$s = preg_replace( '/\s+/u', ' ', $s );
+		$s = trim( $s );
+		return $s;
+	}
+}
+if ( ! function_exists( 'politeia__title_author_hash' ) ) {
+	function politeia__title_author_hash( $title, $author ) {
+		$t = strtolower( trim( politeia__normalize_text( $title ) ) );
+		$a = strtolower( trim( politeia__normalize_text( $author ) ) );
+		return hash( 'sha256', $t . '|' . $a );
+	}
+}
 
-// Si quieres permitir invitados (no recomendado), descomenta:
-// add_action('wp_ajax_nopriv_politeia_buttons_confirm',     ['Politeia_Buttons_Confirm_Controller','ajax_confirm_items']);
-// add_action('wp_ajax_nopriv_politeia_buttons_confirm_all', ['Politeia_Buttons_Confirm_Controller','ajax_confirm_all']);
+/**
+ * Nucleo: procesa una lista de items [{title,author,year?}] para el usuario actual.
+ * - Devuelve conteos y errores.
+ *
+ * @param array<int,array<string,mixed>> $items
+ * @return array{confirmed:int, errors:int, details:array}
+ */
+function politeia_buttons_confirm_process_items( array $items ) {
+	if ( ! is_user_logged_in() ) {
+		return [ 'confirmed' => 0, 'errors' => count($items), 'details' => [ 'error' => 'not_logged_in' ] ];
+	}
 
-endif;
+	global $wpdb;
+	$user_id     = get_current_user_id();
+	$tbl_confirm = $wpdb->prefix . 'politeia_book_confirm';
+	$tbl_books   = $wpdb->prefix . 'politeia_books';
+
+	$db  = new Politeia_Book_DB_Handler();
+	$res = $db->is_ready();
+	if ( is_wp_error( $res ) ) {
+		return [
+			'confirmed' => 0,
+			'errors'    => count($items),
+			'details'   => [ 'error' => $res->get_error_message() ],
+		];
+	}
+
+	$confirmed = 0;
+	$errors    = 0;
+	$details   = [];
+
+	foreach ( $items as $idx => $it ) {
+		$title  = isset($it['title'])  ? trim((string)$it['title'])  : '';
+		$author = isset($it['author']) ? trim((string)$it['author']) : '';
+		$year   = isset($it['year'])   ? (int)$it['year']            : null;
+
+		if ( $title === '' || $author === '' ) {
+			$errors++;
+			$details[] = [ 'index' => $idx, 'ok' => false, 'reason' => 'invalid_item' ];
+			continue;
+		}
+
+		$hash  = politeia__title_author_hash( $title, $author );
+		$extra = [];
+		if ( $year && $year > 0 ) $extra['year'] = $year;
+
+		// 1) Asegurar libro y vinculo
+		$ens = $db->ensure_book_and_link_user( $user_id, $title, $author, $extra );
+
+		if ( ! $ens['ok'] || ! $ens['book_id'] ) {
+			$errors++;
+			$details[] = [
+				'index'  => $idx,
+				'ok'     => false,
+				'reason' => 'ensure_failed',
+				'meta'   => [ 'method' => $ens['method'] ?? 'unknown' ]
+			];
+			continue; // NO borrar de confirm si falla
+		}
+
+		// 2) Si el libro existía y viene year, podemos completar year si está vacío
+		if ( isset($extra['year']) && $extra['year'] > 0 && ! $ens['created'] ) {
+			// Actualiza sólo si el año está vacío o 0
+			$curr_year = (int) $wpdb->get_var(
+				$wpdb->prepare( "SELECT year FROM {$tbl_books} WHERE id=%d LIMIT 1", $ens['book_id'] )
+			);
+			if ( ! $curr_year ) {
+				$wpdb->update(
+					$tbl_books,
+					[ 'year' => (int) $extra['year'] ],
+					[ 'id'   => (int) $ens['book_id'] ],
+					[ '%d' ],
+					[ '%d' ]
+				);
+			}
+		}
+
+		// 3) Eliminar los pendientes del usuario con ese hash
+		$wpdb->query(
+			$wpdb->prepare(
+				"DELETE FROM {$tbl_confirm}
+				  WHERE user_id=%d AND status='pending' AND title_author_hash=%s",
+				$user_id, $hash
+			)
+		);
+
+		$confirmed++;
+		$details[] = [
+			'index'     => $idx,
+			'ok'        => true,
+			'book_id'   => (int) $ens['book_id'],
+			'created'   => (bool) $ens['created'],
+			'link_ok'   => (bool) $ens['linked'],
+			'link_new'  => (bool) $ens['link_created'],
+			'method'    => (string) $ens['method'],
+		];
+	}
+
+	return [
+		'confirmed' => $confirmed,
+		'errors'    => $errors,
+		'details'   => $details,
+	];
+}
+
+/**
+ * Carga todos los pendientes del usuario desde wp_politeia_book_confirm (fallback para Confirm All
+ * si el front no envía items).
+ * @return array<int,array{title:string,author:string,year:?int}>
+ */
+function politeia_buttons_confirm_fetch_all_pending_for_user() {
+	global $wpdb;
+	$user_id = get_current_user_id();
+	$tbl     = $wpdb->prefix . 'politeia_book_confirm';
+
+	$rows = $wpdb->get_results(
+		$wpdb->prepare(
+			"SELECT title, author
+			   FROM {$tbl}
+			  WHERE user_id=%d AND status='pending'
+			  ORDER BY id ASC
+			  LIMIT 500",
+			$user_id
+		),
+		ARRAY_A
+	);
+
+	$list = [];
+	foreach ( (array) $rows as $r ) {
+		$list[] = [
+			'title'  => (string) $r['title'],
+			'author' => (string) $r['author'],
+			'year'   => null, // el año puede venir del front; si no, se guarda como null
+		];
+	}
+	return $list;
+}
+
+/**
+ * AJAX: Confirm individual (pero acepta array de 1).
+ * POST:
+ *  - nonce
+ *  - items: JSON [{title, author, year?}]
+ */
+function politeia_buttons_confirm_ajax() {
+	try {
+		check_ajax_referer('politeia-chatgpt-nonce', 'nonce');
+		if ( ! is_user_logged_in() ) {
+			wp_send_json_error( 'not_logged_in' );
+		}
+
+		$items_json = isset($_POST['items']) ? wp_unslash($_POST['items']) : '[]';
+		$items      = json_decode( $items_json, true );
+		if ( json_last_error() !== JSON_ERROR_NONE || ! is_array($items) || ! count($items) ) {
+			wp_send_json_error( 'invalid_items' );
+		}
+
+		$out = politeia_buttons_confirm_process_items( $items );
+		wp_send_json_success( $out );
+
+	} catch (Throwable $e) {
+		error_log('[politeia_buttons_confirm] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
+		wp_send_json_error( WP_DEBUG ? $e->getMessage() : 'internal_error' );
+	}
+}
+add_action('wp_ajax_politeia_buttons_confirm', 'politeia_buttons_confirm_ajax');
+// Nota: si NO quieres permitir sin login, no registres nopriv para confirmar.
+// add_action('wp_ajax_nopriv_politeia_buttons_confirm', 'politeia_buttons_confirm_ajax');
+
+/**
+ * AJAX: Confirm All.
+ * POST:
+ *  - nonce
+ *  - items (opcional): JSON [{title,author,year?}, ...]
+ *    Si no viene, el servidor cargará todos los pendientes del usuario.
+ */
+function politeia_buttons_confirm_all_ajax() {
+	try {
+		check_ajax_referer('politeia-chatgpt-nonce', 'nonce');
+		if ( ! is_user_logged_in() ) {
+			wp_send_json_error( 'not_logged_in' );
+		}
+
+		$items = [];
+		if ( isset($_POST['items']) ) {
+			$items_json = wp_unslash($_POST['items']);
+			$items = json_decode( $items_json, true );
+			if ( json_last_error() !== JSON_ERROR_NONE || ! is_array($items) ) {
+				$items = [];
+			}
+		}
+
+		// Fallback: si no se enviaron items, traemos todos los pendientes del usuario
+		if ( empty($items) ) {
+			$items = politeia_buttons_confirm_fetch_all_pending_for_user();
+		}
+
+		if ( empty($items) ) {
+			wp_send_json_success( [ 'confirmed' => 0, 'errors' => 0, 'details' => [] ] );
+		}
+
+		$out = politeia_buttons_confirm_process_items( $items );
+		wp_send_json_success( $out );
+
+	} catch (Throwable $e) {
+		error_log('[politeia_buttons_confirm_all] '.$e->getMessage().' @ '.$e->getFile().':'.$e->getLine());
+		wp_send_json_error( WP_DEBUG ? $e->getMessage() : 'internal_error' );
+	}
+}
+add_action('wp_ajax_politeia_buttons_confirm_all', 'politeia_buttons_confirm_all_ajax');
+// No nopriv aquí a propósito.
