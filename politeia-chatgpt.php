@@ -65,10 +65,19 @@ politeia_chatgpt_safe_require('politeia-chatgpt-api.php');
 politeia_chatgpt_safe_require('politeia-chatgpt-whisper.php');
 politeia_chatgpt_safe_require('politeia-chatgpt-shortcode.php');
 
-// Módulos book-detection
-politeia_chatgpt_safe_require('modules/book-detection/class-book-confirm-schema.php');
-politeia_chatgpt_safe_require('modules/book-detection/functions-book-confirm-queue.php');     // helper para encolar
 
+
+// Módulos book-detection
+// Cargar SIEMPRE las clases base del módulo de libros
+politeia_chatgpt_safe_require('modules/book-detection/class-book-db-handler.php');
+politeia_chatgpt_safe_require('modules/book-detection/class-book-external-api.php');
+politeia_chatgpt_safe_require('modules/book-detection/class-book-confirm-schema.php');
+politeia_chatgpt_safe_require('modules/book-detection/functions-book-confirm-queue.php');
+politeia_chatgpt_safe_require('modules/shortcode/confirm-table-shortcode.php');
+
+// Endpoints AJAX
+politeia_chatgpt_safe_require('modules/book-detection/ajax-book-year-lookup.php');
+politeia_chatgpt_safe_require('modules/buttons/class-buttons-confirm-controller.php');
 /* -------------------------------------------------------------------------
  * Activación: crear/actualizar tabla wp_politeia_book_confirm
  * ------------------------------------------------------------------------- */
