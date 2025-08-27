@@ -1,7 +1,7 @@
 <?php
 /**
  * Class: Politeia_Book_DB_Handler
- * Purpose: Database utilities for book matching, deduplication (hash), insertion, and user linking.
+ * Purpose: Database utilities for book matching, deduplication (hash), insertion, user linking — with slug support.
  * Language: English (all user-facing strings are translatable via the 'politeia-chatgpt' text domain).
  *
  * Assumptions (created by the “Politeia Reading” plugin):
@@ -12,6 +12,7 @@
  *   - title_author_hash (VARCHAR)  // unique dedup key from normalized title+author
  *   - normalized_title  (VARCHAR)
  *   - normalized_author (VARCHAR)
+ *   - slug              (VARCHAR)  // pretty URL id; unique in table
  *
  * This class does not create or migrate tables.
  */
@@ -34,6 +35,9 @@ class Politeia_Book_DB_Handler {
 
     /** @var bool */
     protected $has_norm_author = false;
+
+    /** @var bool */
+    protected $has_slug_col = false;
 
     /** @var string */
     protected $text_domain = 'politeia-chatgpt';
@@ -64,6 +68,7 @@ class Politeia_Book_DB_Handler {
             $this->has_hash_col    = $this->column_exists( $this->tbl_books, 'title_author_hash' );
             $this->has_norm_title  = $this->column_exists( $this->tbl_books, 'normalized_title' );
             $this->has_norm_author = $this->column_exists( $this->tbl_books, 'normalized_author' );
+            $this->has_slug_col    = $this->column_exists( $this->tbl_books, 'slug' );
         }
     }
 
@@ -223,7 +228,7 @@ class Politeia_Book_DB_Handler {
         if ( empty( $rows ) ) return null;
 
         $best = null;
-        $best_score = -1;
+               $best_score = -1;
 
         foreach ( $rows as $r ) {
             $ct = isset( $r[ $col_title ] ) ? $this->normalize( $r[ $col_title ] ) : '';
@@ -247,12 +252,42 @@ class Politeia_Book_DB_Handler {
         return $best;
     }
 
+    /* ============================= Slug helpers ============================= */
+
+    /**
+     * Build a base slug like "insurreccion-fernando-villegas-2020".
+     */
+    protected function build_slug( $title, $author, $year = null ) {
+        $parts = array_filter( [ (string) $title, (string) $author, $year ? (string) $year : null ] );
+        $raw   = trim( implode( ' ', $parts ) );
+        return sanitize_title( remove_accents( $raw ) );
+    }
+
+    /**
+     * Ensure uniqueness of slug within the books table.
+     */
+    protected function unique_slug( $slug ) {
+        global $wpdb;
+        $base = $slug;
+        $i = 2;
+        while ( (int) $wpdb->get_var(
+            $wpdb->prepare( "SELECT COUNT(*) FROM {$this->tbl_books} WHERE slug=%s", $slug )
+        ) > 0 ) {
+            $slug = $base . '-' . $i;
+            $i++;
+            if ( $i > 200 ) break; // safety
+        }
+        return $slug;
+    }
+
+    /* ============================= Inserts / Ensures ============================= */
+
     /**
      * Insert a canonical book (uses optional columns if available).
      *
      * @param string $title
      * @param string $author
-     * @param array  $extra  Optional scalar extras (e.g., 'isbn', 'year', etc.)
+     * @param array  $extra  Optional scalar extras (e.g., 'isbn', 'year', 'slug', etc.)
      * @return int|\WP_Error New book ID or WP_Error
      */
     public function insert_book( $title, $author, $extra = [] ) {
@@ -277,7 +312,16 @@ class Politeia_Book_DB_Handler {
             $fmt[] = '%s';
         }
 
-        // Merge extras (only scalar values; skip keys we already set)
+        // --- NEW: slug generation if column exists ---
+        if ( $this->has_slug_col ) {
+            // Allow caller-specified slug; otherwise build from title/author/year
+            $given = isset( $extra['slug'] ) ? sanitize_title( remove_accents( (string) $extra['slug'] ) ) : '';
+            $seed  = $given !== '' ? $given : $this->build_slug( $title, $author, $extra['year'] ?? null );
+            $data['slug'] = $this->unique_slug( $seed );
+            $fmt[] = '%s';
+        }
+
+        // Merge extras (only scalar, without overwriting already set keys)
         foreach ( (array) $extra as $k => $v ) {
             if ( is_scalar( $v ) && ! array_key_exists( $k, $data ) ) {
                 $data[ $k ] = sanitize_text_field( (string) $v );
@@ -323,6 +367,20 @@ class Politeia_Book_DB_Handler {
 
         $match = $this->find_best_match_internal( $title, $author );
         if ( $match['match'] ) {
+            // If the book exists but has no slug, fill it (when slug column exists)
+            if ( $this->has_slug_col && ( empty( $match['match']['slug'] ) || $match['match']['slug'] === null ) ) {
+                global $wpdb;
+                $slug = $this->unique_slug( $this->build_slug( $title, $author, $extra['year'] ?? null ) );
+                $wpdb->update(
+                    $this->tbl_books,
+                    [ 'slug' => $slug ],
+                    [ 'id'   => (int) $match['match']['id'] ],
+                    [ '%s' ],
+                    [ '%d' ]
+                );
+                $match['match']['slug'] = $slug;
+            }
+
             return [
                 'book_id' => isset($match['match']['id']) ? (int) $match['match']['id'] : 0,
                 'created' => false,
@@ -431,7 +489,7 @@ class Politeia_Book_DB_Handler {
         ];
     }
 
-    /* ============================= Helpers ============================= */
+    /* ============================= Low-level DB helpers ============================= */
 
     /**
      * Check if a DB table exists.
